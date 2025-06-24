@@ -1,0 +1,92 @@
+import pandas as pd
+import numpy as np
+from scipy.interpolate import interp1d
+
+def reorder_coordinates(file_path, output_file):
+
+    # Read the Excel file, assuming no header and naming columns 'x' and 'z'
+    df = pd.read_excel(file_path, header=None, names=['x', 'z'])
+
+    # Convert coordinates to numeric, handling errors by setting invalid values to NaN
+    df['x'] = pd.to_numeric(df['x'], errors='coerce')
+    df['z'] = pd.to_numeric(df['z'], errors='coerce')
+
+    # Remove rows with NaN values
+    df = df.dropna(subset=['x', 'z']).reset_index(drop=True)
+
+    # Remove duplicate coordinate pairs
+    df = df.drop_duplicates().reset_index(drop=True)
+
+    # Calculate min/max x-values and define sections for camber line calculation
+    x_min_val = df['x'].min()
+    x_max_val = df['x'].max()
+    num_bins = 100
+    bin_edges = np.linspace(x_min_val, x_max_val, num_bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.
+    tol = (x_max_val - x_min_val) / (2 * num_bins)  # Tolerance
+
+    # Calculate camber line values
+    camber_vals = []
+    for center in bin_centers:
+        # Find points within the current section
+        subset = df[(df['x'] >= center - tol) & (df['x'] <= center + tol)]
+        if len(subset) > 0:
+            # Calculate the midpoint of z-values within the section
+            local_min = subset['z'].min()
+            local_max = subset['z'].max()
+            camber_vals.append((local_max + local_min) / 2.)
+        else:
+            # Use NaN if no points are within the bin
+            camber_vals.append(np.nan)
+
+    # Convert to numpy arrays
+    bin_centers = np.array(bin_centers)
+    camber_vals = np.array(camber_vals)
+
+    # Check for valid camber values
+    valid = ~np.isnan(camber_vals)
+    # If not enough valid camber points, approximate with a straight line
+    if valid.sum() < 2:
+        A = df.loc[df['x'].idxmin()]
+        B = df.loc[df['x'].idxmax()]
+        A_x, A_z = A['x'], A['z']
+        B_x, B_z = B['x'], B['z']
+        slope = 0 if B_x == A_x else (B_z - A_z) / (B_x - A_x)
+        camber_func = lambda x: A_z + slope * (x - A_x)
+    # Otherwise, interpolate the camber line
+    else:
+        camber_func = interp1d(bin_centers[valid], camber_vals[valid], kind='linear', fill_value="extrapolate")
+
+    # Assign points to upper or lower surface based on camber line
+    def assign_surface(row):
+        return 'upper' if row['z'] >= camber_func(row['x']) else 'lower'
+
+    df['Surface'] = df.apply(assign_surface, axis=1)
+
+    # Separate upper and lower surfaces
+    upper = df[df['Surface'] == 'upper'].copy()
+    lower = df[df['Surface'] == 'lower'].copy()
+
+    # Sort upper surface from right to left, lower surface from left to right
+    upper.sort_values(by='x', ascending=False, inplace=True)
+    lower.sort_values(by='x', ascending=True, inplace=True)
+
+    # Handle potential overlap at trailing edge
+    if not upper.empty and not lower.empty:
+        if np.allclose(upper.iloc[-1][['x', 'z']].astype(float), lower.iloc[0][['x', 'z']].astype(float)):
+            lower = lower.iloc[1:]
+
+    # Link upper and lower surfaces
+    ordered_df = pd.concat([upper, lower], ignore_index=True)
+
+    # Close the airfoil loop if necessary
+    if not np.allclose(ordered_df.iloc[0][['x', 'z']].astype(float), ordered_df.iloc[-1][['x', 'z']].astype(float)):
+        ordered_df = pd.concat([ordered_df, ordered_df.iloc[[0]]], ignore_index=True)
+
+    # Save the reordered coordinates to the output file
+    ordered_df[['x', 'z']].to_excel(output_file, index=False, header=False)
+
+if __name__ == "__main__":
+    input_file = r"Input.xlsx"
+    output_file = r"Output.xlsx"
+    reorder_coordinates(input_file, output_file)
