@@ -1,0 +1,333 @@
+using UnityEngine;
+using System.Collections.Generic;
+using System.IO;
+using System;
+using System.Linq;
+
+[System.Serializable]
+public class BoneMass
+{
+    public Transform bone;
+    public float mass;
+    public string name;
+}
+
+public class TorqueCalculator : MonoBehaviour
+{
+    public Animation animation;
+    public string animationName;
+    public List<BoneMass> boneMasses = new List<BoneMass>();
+    public float animationFrameRate = 24.0f;
+    public float flapFrequencyHz = 15.0f;
+
+    private AnimationClip clip;
+    private Dictionary<Transform, List<float>> energyPerBoneSubtreePerFrame = new Dictionary<Transform, List<float>>();
+    private Dictionary<Transform, List<float>> torquePerBoneSubtreePerFrame = new Dictionary<Transform, List<float>>();
+    private Dictionary<Transform, List<Vector3>> boneAngularVelocitiesPerFrame = new Dictionary<Transform, List<Vector3>>();
+
+    private Dictionary<Transform, float> boneMassLookup = new Dictionary<Transform, float>();
+
+    private float actualFlapTime;
+    private int frameCount;
+    private float physicsDeltaTime;
+
+    void Start()
+    {
+        if (flapFrequencyHz <= 0)
+        {
+            Debug.LogError("Flap frequency must be greater than zero.");
+            return;
+        }
+        actualFlapTime = 1.0f / flapFrequencyHz;
+
+        foreach (var boneMass in boneMasses)
+        {
+            if (boneMass.bone != null)
+            {
+                boneMassLookup[boneMass.bone] = boneMass.mass;
+            }
+            else
+            {
+                Debug.LogWarning($"Bone reference is missing for BoneMass entry: {boneMass.name}");
+            }
+        }
+
+        foreach (var boneMass in boneMasses)
+        {
+            if (boneMass.bone != null)
+            {
+                energyPerBoneSubtreePerFrame[boneMass.bone] = new List<float>();
+                torquePerBoneSubtreePerFrame[boneMass.bone] = new List<float>();
+                boneAngularVelocitiesPerFrame[boneMass.bone] = new List<Vector3>();
+            }
+        }
+
+        clip = animation.GetClip(animationName);
+
+        frameCount = (int)(clip.length * animationFrameRate);
+        physicsDeltaTime = actualFlapTime / frameCount;
+
+
+        CalculateEnergyAndTorque();
+    }
+
+    private List<Transform> GetAllDescendants(Transform parent, List<Transform> list = null)
+    {
+        if (list == null)
+        {
+            list = new List<Transform>();
+        }
+
+        list.Add(parent);
+
+        for (int i = 0; i < parent.childCount; i++)
+        {
+            GetAllDescendants(parent.GetChild(i), list);
+        }
+
+        return list;
+    }
+
+    private float CalculateSubtreeInertia(Transform currentBone)
+    {
+        float totalInertia = 0f;
+        Vector3 pivotPosition = currentBone.position;
+
+        List<Transform> subtreeBones = GetAllDescendants(currentBone);
+
+        foreach (Transform bone in subtreeBones)
+        {
+            float boneMass = boneMassLookup.ContainsKey(bone) ? boneMassLookup[bone] : 0f;
+
+            if (boneMass > 0)
+            {
+                float distSq = Vector3.SqrMagnitude(bone.position - pivotPosition);
+                totalInertia += boneMass * distSq;
+            }
+        }
+
+        return totalInertia;
+    }
+
+
+    void CalculateEnergyAndTorque()
+    {
+        Quaternion[] previousLocalRotations = new Quaternion[boneMasses.Count];
+        Vector3[] previousAngularVelocities = new Vector3[boneMasses.Count];
+
+        animation.Play(animationName);
+        animation[animationName].time = 0;
+        animation.Sample();
+
+        for (int i = 0; i < boneMasses.Count; i++)
+        {
+            if (boneMasses[i].bone != null)
+            {
+                previousLocalRotations[i] = boneMasses[i].bone.localRotation;
+                previousAngularVelocities[i] = Vector3.zero;
+                energyPerBoneSubtreePerFrame[boneMasses[i].bone].Add(0);
+                torquePerBoneSubtreePerFrame[boneMasses[i].bone].Add(0);
+                boneAngularVelocitiesPerFrame[boneMasses[i].bone].Add(Vector3.zero);
+            }
+        }
+
+        for (int frame = 1; frame < frameCount; frame++)
+        {
+            float samplingTime = (float)frame / animationFrameRate;
+
+            animation.Play(animationName);
+            animation[animationName].time = samplingTime;
+            animation.Sample();
+
+            foreach (var boneMass in boneMasses)
+            {
+                if (boneMass.bone != null)
+                {
+                    energyPerBoneSubtreePerFrame[boneMass.bone].Add(0);
+                    torquePerBoneSubtreePerFrame[boneMass.bone].Add(0);
+                    boneAngularVelocitiesPerFrame[boneMass.bone].Add(Vector3.zero);
+                }
+            }
+
+
+            Quaternion[] currentLocalRotations = new Quaternion[boneMasses.Count];
+            Vector3[] currentAngularVelocities = new Vector3[boneMasses.Count];
+            Vector3[] angularAccelerations = new Vector3[boneMasses.Count];
+
+            for (int i = 0; i < boneMasses.Count; i++)
+            {
+                Transform currentBone = boneMasses[i].bone;
+                if (currentBone == null) continue;
+
+                currentLocalRotations[i] = currentBone.localRotation;
+
+                Quaternion rotationDiff = currentLocalRotations[i] * Quaternion.Inverse(previousLocalRotations[i]);
+                float angle;
+                Vector3 axis;
+                rotationDiff.ToAngleAxis(out angle, out axis);
+
+                if (angle > 1e-6f && !float.IsNaN(angle))
+                {
+                    angle *= Mathf.Deg2Rad;
+                    currentAngularVelocities[i] = axis.normalized * angle / physicsDeltaTime;
+                }
+                else
+                {
+                    currentAngularVelocities[i] = Vector3.zero;
+                }
+
+                angularAccelerations[i] = (currentAngularVelocities[i] - previousAngularVelocities[i]) / physicsDeltaTime;
+
+                float subtreeInertia = CalculateSubtreeInertia(currentBone);
+
+                Vector3 torqueVector = subtreeInertia * angularAccelerations[i];
+                float torqueMagnitude = torqueVector.magnitude;
+
+                float kineticEnergy = 0.5f * subtreeInertia * currentAngularVelocities[i].sqrMagnitude;
+
+                energyPerBoneSubtreePerFrame[currentBone][frame] = kineticEnergy;
+                torquePerBoneSubtreePerFrame[currentBone][frame] = torqueMagnitude;
+
+                boneAngularVelocitiesPerFrame[currentBone][frame] = currentAngularVelocities[i];
+            }
+
+            for (int i = 0; i < boneMasses.Count; i++)
+            {
+                Transform currentBone = boneMasses[i].bone;
+                if (currentBone == null) continue;
+
+                previousLocalRotations[i] = currentLocalRotations[i];
+                previousAngularVelocities[i] = currentAngularVelocities[i];
+            }
+        }
+
+        string csvPath = @"Path";
+
+        string directory = Path.GetDirectoryName(csvPath);
+        if (!Directory.Exists(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        try
+        {
+            using (StreamWriter writer = new StreamWriter(csvPath))
+            {
+                writer.Write("Frame,Time(s),");
+                foreach (var boneMass in boneMasses)
+                {
+                    if (boneMass.bone != null)
+                        writer.Write($"{boneMass.name} Energy (J),");
+                }
+                foreach (var boneMass in boneMasses)
+                {
+                    if (boneMass.bone != null)
+                        writer.Write($"{boneMass.name} Torque (Nm),");
+                }
+                foreach (var boneMass in boneMasses)
+                {
+                    if (boneMass.bone != null)
+                        writer.Write($"{boneMass.name} AngVel (Rad/s),");
+                }
+                writer.WriteLine();
+
+                for (int frame = 0; frame < frameCount; frame++)
+                {
+                    writer.Write($"{frame + 1},{frame * physicsDeltaTime:F6},");
+
+                    foreach (var boneMass in boneMasses)
+                    {
+                        if (boneMass.bone != null)
+                            writer.Write($"{energyPerBoneSubtreePerFrame[boneMass.bone][frame]:F12},");
+                    }
+
+                    foreach (var boneMass in boneMasses)
+                    {
+                        if (boneMass.bone != null)
+                            writer.Write($"{torquePerBoneSubtreePerFrame[boneMass.bone][frame]:F12},");
+                    }
+
+                    foreach (var boneMass in boneMasses)
+                    {
+                        if (boneMass.bone != null)
+                            writer.Write($"{boneAngularVelocitiesPerFrame[boneMass.bone][frame].magnitude:F12},");
+                    }
+
+                    writer.WriteLine();
+                }
+
+                writer.Write("Total (Sum over frames),,");
+
+                foreach (var boneMass in boneMasses)
+                {
+                    if (boneMass.bone != null)
+                    {
+                        float boneSubtreeTotalEnergy = energyPerBoneSubtreePerFrame[boneMass.bone].Sum();
+                        writer.Write($"{boneSubtreeTotalEnergy:F12},");
+                    }
+                }
+
+                foreach (var boneMass in boneMasses)
+                {
+                    if (boneMass.bone != null)
+                    {
+                        float boneSubtreeTotalTorque = torquePerBoneSubtreePerFrame[boneMass.bone].Sum();
+                        writer.Write($"{boneSubtreeTotalTorque:F12},");
+                    }
+                }
+
+                for (int i = 0; i < boneMasses.Count; i++)
+                {
+                    if (boneMasses[i].bone != null)
+                        writer.Write(",");
+                }
+
+                writer.WriteLine();
+
+                writer.Write("Peak (Max over frames),,");
+                foreach (var boneMass in boneMasses)
+                {
+                    if (boneMass.bone != null)
+                        writer.Write($"{energyPerBoneSubtreePerFrame[boneMass.bone].Max():F12},");
+                }
+                foreach (var boneMass in boneMasses)
+                {
+                    if (boneMass.bone != null)
+                        writer.Write($"{torquePerBoneSubtreePerFrame[boneMass.bone].Max():F12},");
+                }
+                foreach (var boneMass in boneMasses)
+                {
+                    if (boneMass.bone != null)
+                        writer.Write($"{boneAngularVelocitiesPerFrame[boneMass.bone].Max(v => v.magnitude):F12},");
+                }
+                writer.WriteLine();
+
+
+                float totalSystemEnergyChange = 0;
+                foreach (var boneMass in boneMasses)
+                {
+                    if (boneMass.bone != null)
+                    {
+                        totalSystemEnergyChange += energyPerBoneSubtreePerFrame[boneMass.bone].Sum();
+                    }
+                }
+
+
+                writer.Write("Average Power (W), Energy/sec,,");
+                float averagePowerTotalSystem = totalSystemEnergyChange / actualFlapTime;
+                writer.Write($"{averagePowerTotalSystem:F12},");
+
+                for (int i = 0; i < boneMasses.Count * 2 + 1; i++)
+                {
+                    writer.Write(",");
+                }
+                writer.WriteLine();
+            }
+
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Failed to write to {csvPath}: {e.Message}");
+        }
+    }
+}
