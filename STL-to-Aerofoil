@@ -1,0 +1,149 @@
+import trimesh
+import numpy as np
+import pandas as pd
+from scipy.spatial import KDTree
+from scipy.interpolate import interp1d
+import os
+
+
+def remove_duplicate_noise(all_points, threshold=5e-2):
+    """Removes duplicate points that are close to each other."""
+    if all_points.shape[0] == 0:
+        return all_points
+    tree = KDTree(all_points)
+    clusters = []
+    visited = set()
+    for i, point in enumerate(all_points):
+        if i in visited:
+            continue
+        neighbors = tree.query_ball_point(point, threshold)
+        cluster = np.mean(all_points[neighbors], axis=0)
+        clusters.append(cluster)
+        visited.update(neighbors)
+    return np.array(clusters) if len(clusters) > 1 else all_points
+
+
+def save_intersection_to_excel(intersections, plane_origins, sampling_frequency, output_prefix, output_dir):
+    """Saves intersection points to Excel files."""
+    for i, (plane_origin, intersection_segments) in enumerate(zip(plane_origins, intersections)):
+        all_points = np.vstack(intersection_segments) if len(intersection_segments) > 0 else np.array([])
+        if all_points.size > 0:
+            yz_center = np.mean(all_points[:, 1:], axis=0)
+            all_points[:, 1:] -= yz_center
+
+            all_points[:, 1] *= -1
+
+            sampled_indices = np.linspace(0, len(all_points) - 1, sampling_frequency, dtype=int)
+            sampled_points = all_points[sampled_indices]
+            sampled_points[:, 1:] *= 0.1
+
+            df = pd.DataFrame(sampled_points[:, 1:], columns=['x', 'z'])
+            excel_file = os.path.join(output_dir, f"{output_prefix}_{i}.xlsx")
+            df.to_excel(excel_file, index=False, header=False)
+
+
+def reorder_coordinates(file_path, output_file):
+    """Reorders coordinates for XFLR5 import using a mean camber line."""
+
+    df = pd.read_excel(file_path, header=None, names=['x', 'z'])
+    df['x'] = pd.to_numeric(df['x'], errors='coerce')
+    df['z'] = pd.to_numeric(df['z'], errors='coerce')
+    df = df.dropna(subset=['x', 'z']).reset_index(drop=True)
+    df = df.drop_duplicates().reset_index(drop=True)
+
+    x_min_val = df['x'].min()
+    x_max_val = df['x'].max()
+    num_bins = 100
+    bin_edges = np.linspace(x_min_val, x_max_val, num_bins + 1)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.
+    tol = (x_max_val - x_min_val) / (2 * num_bins)
+    camber_vals = []
+    for center in bin_centers:
+        subset = df[(df['x'] >= center - tol) & (df['x'] <= center + tol)]
+        if len(subset) > 0:
+            local_min = subset['z'].min()
+            local_max = subset['z'].max()
+            camber_vals.append((local_max + local_min) / 2.)
+        else:
+            camber_vals.append(np.nan)
+
+    bin_centers = np.array(bin_centers)
+    camber_vals = np.array(camber_vals)
+    valid = ~np.isnan(camber_vals)
+    if valid.sum() < 2:
+        A = df.loc[df['x'].idxmin()]
+        B = df.loc[df['x'].idxmax()]
+        A_x, A_z = A['x'], A['z']
+        slope = 0 if B_x == A_x else (B['z'] - A_z) / (B['x'] - A_x)
+        camber_func = lambda x: A_z + slope * (x - A_x)
+    else:
+        camber_func = interp1d(bin_centers[valid], camber_vals[valid], kind='linear', fill_value="extrapolate")
+
+    def assign_surface(row):
+        return 'upper' if row['z'] >= camber_func(row['x']) else 'lower'
+
+    df['Surface'] = df.apply(assign_surface, axis=1)
+    upper = df[df['Surface'] == 'upper'].copy()
+    lower = df[df['Surface'] == 'lower'].copy()
+
+
+    upper.sort_values(by='x', ascending=False, inplace=True)
+    lower.sort_values(by='x', ascending=True, inplace=True)
+
+
+    if not upper.empty and not lower.empty:
+        if np.allclose(upper.iloc[-1][['x', 'z']].astype(float), lower.iloc[0][['x', 'z']].astype(float)):
+            lower = lower.iloc[1:]
+
+    ordered_df = pd.concat([upper, lower], ignore_index=True)
+    if not np.allclose(ordered_df.iloc[0][['x', 'z']].astype(float), ordered_df.iloc[-1][['x', 'z']].astype(float)):
+        ordered_df = pd.concat([ordered_df, ordered_df.iloc[[0]]], ignore_index=True)
+
+    ordered_df[['x', 'z']].to_excel(output_file, index=False, header=False)
+
+
+def convert_excel_to_dat(excel_file, dat_file):
+    """Converts an Excel file to a DAT file."""
+    df = pd.read_excel(excel_file, header=None)
+    df.to_csv(dat_file, sep=' ', index=False, header=False)
+    
+
+def main(stl_file, plane_normal, section_frequency, sampling_frequency, cutoff_ratio, output_prefix, output_dir):
+    """Loads STL, calculates bounds, defines planes, computes intersections, and saves to files."""
+    mesh = trimesh.load_mesh(stl_file)
+    bounds = mesh.bounds[:, 0]
+    x_min, x_max = bounds[0], bounds[1]
+    cutoff = (x_max - x_min) * cutoff_ratio
+    plane_positions = np.linspace(x_min + cutoff, x_max - cutoff, section_frequency)
+
+    plane_origins = [np.array([pos if plane_normal[0] else 0,
+                               pos if plane_normal[1] else 0,
+                               pos if plane_normal[2] else 0]) for pos in plane_positions]
+
+    intersections = [trimesh.intersections.mesh_plane(mesh, plane_normal, origin) for origin in plane_origins]
+
+    save_intersection_to_excel(intersections, plane_origins, sampling_frequency, output_prefix, output_dir)
+
+    for i in range(section_frequency):
+        excel_file = os.path.join(output_dir, f"{output_prefix}_{i}.xlsx")
+        reordered_excel = os.path.join(output_dir, f"{output_prefix}_{i}_reordered.xlsx")
+        dat_file = os.path.join(output_dir, f"{output_prefix}_{i}.dat")
+        if os.path.exists(excel_file):
+            reorder_coordinates(excel_file, reordered_excel)
+            convert_excel_to_dat(reordered_excel, dat_file)
+            os.remove(excel_file)
+            os.remove(reordered_excel)
+
+    return intersections, plane_origins
+
+
+if __name__ == "__main__":
+    stl_file = r"STL_File_Location"
+    plane_normal = np.array([1, 0, 0])
+    section_frequency = 30
+    sampling_frequency = 298
+    cutoff_ratio = 0.02
+    output_prefix = "airfoil"
+    output_dir = r"Output_Folder_Location"
+
+    intersections, plane_origins = main(stl_file, plane_normal, section_frequency, sampling_frequency, cutoff_ratio, output_prefix, output_dir)
